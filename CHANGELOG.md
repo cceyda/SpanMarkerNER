@@ -17,6 +17,16 @@ Types of changes
 
 ## [Unreleased]
 
+### Fixed
+
+- Resolved tricky issue causing models to learn to never predict the last token as an entity (Closes [#1](https://github.com/tomaarsen/SpanMarkerNER/pull/1)).
+
+## [0.2.2] - 2023-04-13
+
+### Fixed
+
+- Correctly propagate `SpanMarkerModel.from_pretrained` kwargs to Config initialisation.
+
 ## [0.2.1] - 2023-04-07
 
 ### Added
