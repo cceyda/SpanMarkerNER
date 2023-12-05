@@ -1,13 +1,15 @@
+from itertools import chain
 from typing import Dict
 
 import evaluate
+from sklearn.metrics import confusion_matrix
 import torch
 from transformers import EvalPrediction
 
 from span_marker.tokenizer import SpanMarkerTokenizer
 
 
-def compute_f1_via_seqeval(tokenizer: SpanMarkerTokenizer, eval_prediction: EvalPrediction) -> Dict[str, float]:
+def compute_f1_via_seqeval(tokenizer: SpanMarkerTokenizer, eval_prediction: EvalPrediction, log_detailed:bool=True,label2id=None) -> Dict[str, float]:
     """Compute micro-F1, recall, precision and accuracy scores using ``seqeval`` for the evaluation predictions.
 
     Note:
@@ -56,6 +58,8 @@ def compute_f1_via_seqeval(tokenizer: SpanMarkerTokenizer, eval_prediction: Eval
     id2label = tokenizer.config.id2label
     # seqeval works wonders for NER evaluation
     seqeval = evaluate.load("seqeval")
+    true_labels=[]
+    prediction_labels=[]
     for sample in sample_dict.values():
         spans = sample["spans"]
         scores = sample["scores"]
@@ -76,11 +80,21 @@ def compute_f1_via_seqeval(tokenizer: SpanMarkerTokenizer, eval_prediction: Eval
             if pred_label != outside_id and all(pred_labels_per_tokens[i] == "O" for i in range(span[0], span[1])):
                 pred_labels_per_tokens[span[0]] = "B-" + id2label[pred_label]
                 pred_labels_per_tokens[span[0] + 1 : span[1]] = ["I-" + id2label[pred_label]] * (span[1] - span[0] - 1)
-
+        true_labels.append(gold_labels_per_tokens)
+        prediction_labels.append(pred_labels_per_tokens)
         seqeval.add(prediction=pred_labels_per_tokens, reference=gold_labels_per_tokens)
+    cm=None
+    try:
+        cm = confusion_matrix(list(chain.from_iterable(true_labels)), list(chain.from_iterable(prediction_labels)),
+        labels=list(label2id.keys()))
+    except Exception as e:
+        print(e)
 
     results = seqeval.compute()
     # `results` also contains e.g. "person-athlete": {'precision': 0.5982658959537572, 'recall': 0.9, 'f1': 0.71875, 'number': 230}
     # logging this all is overkill. Tensorboard doesn't even support it, WandB does, but it's not very useful generally.
     # I'd like to revisit this to expose this information somehow still
-    return {key: value for key, value in results.items() if isinstance(value, float)}
+    if log_detailed:
+        return results,cm
+    else:
+        return {key: value for key, value in results.items() if isinstance(value, float)}

@@ -1,4 +1,5 @@
 import itertools
+from itertools import accumulate
 import os
 import warnings
 from typing import Any, Dict, Iterator, List, Tuple, Union
@@ -7,11 +8,34 @@ from transformers import AutoTokenizer, PreTrainedTokenizer
 
 from span_marker.configuration import SpanMarkerConfig
 
+from tokenizers.pre_tokenizers import PreTokenizer
+from tokenizers import NormalizedString, PreTokenizedString, Token
+from tokenizers import normalizers
+from tokenizers import pre_tokenizers
+from tokenizers.pre_tokenizers import Digits,UnicodeScripts,Punctuation,Whitespace
+class CustomPreTokenizer():
+
+        def char_tokenize(self,i, normalized_string):
+            return [normalized_string.slice((i,i+1)) for i in range(0,len(str(normalized_string)))]
+
+        def word_tokenize(self,i, normalized_string):
+            return normalized_string.split(pattern=" ",behavior="isolated")
+        
+        def pre_tokenize(self, pretokenized_string):
+            pretokenized_string.split(self.word_tokenize)
+            pretokenized_string.split(self.char_tokenize)
 
 class SpanMarkerTokenizer:
     def __init__(self, tokenizer: PreTrainedTokenizer, config: SpanMarkerConfig, **kwargs) -> None:
+        tokenizer._tokenizer.normalizer=normalizers.Sequence([])
+        tokenizer._tokenizer.pre_tokenizer=PreTokenizer.custom(CustomPreTokenizer())
+        def save_tok(tok):
+            pass
+        tokenizer._tokenizer.save=save_tok
+        
         self.tokenizer = tokenizer
         self.config = config
+        self.span_tokenizer = pre_tokenizers.Sequence([Whitespace(),UnicodeScripts(),Punctuation()])
 
         tokenizer.add_tokens(["<start>", "<end>"], special_tokens=True)
         self.start_marker_id, self.end_marker_id = self.tokenizer.convert_tokens_to_ids(["<start>", "<end>"])
@@ -25,6 +49,19 @@ class SpanMarkerTokenizer:
             self.tokenizer.model_max_length, self.config.model_max_length or self.config.model_max_length_default
         )
 
+    # def get_all_valid_spans(self, sentence:str, entity_max_length: int) -> Iterator[Tuple[int, int]]:
+    #     tokens=self.span_tokenizer.pre_tokenize_str(sentence)
+    #     t=[(t[1][0],min(t[1][1],t[1][0]+1+entity_max_length)) for t in tokens]
+    #     for (s,e) in t:
+    #         for x in range(s,e):
+    #             yield(s, x)
+
+    # def get_all_valid_spans_and_labels(
+    #     self, num_words: int, span_to_label: Dict[Tuple[int, int], int], entity_max_length: int, outside_id: int
+    # ) -> Iterator[Tuple[Tuple[int, int], int]]:
+    #     for span in self.get_all_valid_spans(num_words, entity_max_length):
+    #         yield span, span_to_label.get(span, outside_id)
+    
     def get_all_valid_spans(self, num_words: int, entity_max_length: int) -> Iterator[Tuple[int, int]]:
         for start_idx in range(num_words):
             for end_idx in range(start_idx + 1, min(num_words + 1, start_idx + 1 + entity_max_length)):
@@ -43,10 +80,10 @@ class SpanMarkerTokenizer:
             return super().__getattribute__("tokenizer").__getattribute__(key)
 
     def __call__(
-        self, inputs, labels=None, return_num_words: bool = False, return_batch_encoding=False, **kwargs
+        self, inputs, labels=None, return_num_words: bool = False, return_batch_encoding=False, return_group_lengths=False, **kwargs
     ) -> Dict[str, List]:
         # TODO: Increase robustness of this
-        is_split_into_words = True
+        is_split_into_words = False
         if isinstance(inputs, str) or (inputs and " " in inputs[0]):
             is_split_into_words = False
 
@@ -66,6 +103,7 @@ class SpanMarkerTokenizer:
         all_end_position_ids = []
         all_labels = []
         all_num_words = []
+        group_lengths= []
 
         for sample_idx, input_ids in enumerate(batch_encoding["input_ids"]):
             word_ids = itertools.takewhile(lambda word_id: word_id is not None, batch_encoding.word_ids(sample_idx)[1:])
@@ -85,7 +123,7 @@ class SpanMarkerTokenizer:
                 )
             else:
                 spans = list(self.get_all_valid_spans(num_words, self.config.entity_max_length))
-
+            group_length=0
             for group_start_idx in range(0, len(spans), self.config.marker_max_length):
                 group_spans = spans[group_start_idx : group_start_idx + self.config.marker_max_length]
                 group_num_spans = len(group_spans)
@@ -102,6 +140,7 @@ class SpanMarkerTokenizer:
                 all_num_spans.append(group_num_spans)
                 all_start_position_ids.append(start_position_ids)
                 all_end_position_ids.append(end_position_ids)
+                group_length+=1
 
                 if labels:
                     group_labels = span_labels[group_start_idx : group_start_idx + self.config.marker_max_length]
@@ -109,6 +148,7 @@ class SpanMarkerTokenizer:
 
                 if return_num_words:
                     all_num_words.append(num_words)
+            group_lengths.append(group_length)
 
         output = {
             "input_ids": all_input_ids,
@@ -116,6 +156,9 @@ class SpanMarkerTokenizer:
             "start_position_ids": all_start_position_ids,
             "end_position_ids": all_end_position_ids,
         }
+        if return_group_lengths:
+            output["group_lengths"] = list(accumulate([0]+group_lengths))
+            
         if labels:
             output["labels"] = all_labels
         if return_num_words:

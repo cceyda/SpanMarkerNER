@@ -148,12 +148,15 @@ class SpanMarkerModel(PreTrainedModel):
         feature_vector = self.dropout(feature_vector)
         logits = self.classifier(feature_vector)
 
-        if labels is not None:
-            loss = self.loss_func(logits.view(-1, self.config.num_labels), labels.view(-1))
+        # if labels is not None:
+        #     loss = self.loss_func(logits.view(-1, self.config.num_labels), labels.view(-1))
+        return logits
+        # return SpanMarkerOutput(
+        #     loss=0, logits=logits, *outputs[2:], num_words=num_words
+        # )
+        # output = (logits,) + outputs[2:]
+        # return ((loss,) + output) if loss is not None else output
 
-        return SpanMarkerOutput(
-            loss=loss if labels is not None else None, logits=logits, *outputs[2:], num_words=num_words
-        )
 
     @classmethod
     def from_pretrained(
@@ -293,10 +296,8 @@ class SpanMarkerModel(PreTrainedModel):
 
         # Check if inputs is a string, i.e. a string sentence, or
         # if it is a list of strings without spaces, i.e. if it's 1 tokenized sentence
-        if isinstance(inputs, str) or (
-            isinstance(inputs, list) and all(isinstance(element, str) and " " not in element for element in inputs)
-        ):
-            return self._predict_one(inputs, allow_overlapping=allow_overlapping)
+        if isinstance(inputs, str):
+            return self._predict_one(inputs)
 
         # Otherwise, we likely have a list of strings, i.e. a list of string sentences,
         # or a list of lists of strings, i.e. a list of tokenized sentences
@@ -319,7 +320,7 @@ class SpanMarkerModel(PreTrainedModel):
         # Moving the inputs to the right device
         inputs = {key: value.to(self.device) for key, value in collated.items()}
 
-        logits = self(**inputs)[0]
+        logits = self(**inputs)
         # Computing probabilities based on the logits
         probs = logits.softmax(-1)
         # Get the labels and the correponding probability scores
@@ -346,7 +347,7 @@ class SpanMarkerModel(PreTrainedModel):
                 char_end_index = batch_encoding.word_to_chars(0, word_end_index - 1).end
                 output.append(
                     {
-                        "span": sentence[char_start_index:char_end_index]
+                        "word": sentence[char_start_index:char_end_index]
                         if isinstance(sentence, str)
                         else sentence[word_start_index:word_end_index],
                         "label": id2label[label_id],
@@ -354,8 +355,8 @@ class SpanMarkerModel(PreTrainedModel):
                     }
                 )
                 if isinstance(sentence, str):
-                    output[-1]["char_start_index"] = char_start_index
-                    output[-1]["char_end_index"] = char_end_index
+                    output[-1]["start"] = char_start_index
+                    output[-1]["end"] = char_end_index
                 else:
                     output[-1]["word_start_index"] = word_start_index
                     output[-1]["word_end_index"] = word_end_index
@@ -364,8 +365,87 @@ class SpanMarkerModel(PreTrainedModel):
                     word_selected[word_start_index:word_end_index] = [True] * (word_end_index - word_start_index)
         return sorted(
             output,
-            key=lambda entity: entity["char_start_index"] if isinstance(sentence, str) else entity["word_start_index"],
+            key=lambda entity: entity["start"] if isinstance(sentence, str) else entity["word_start_index"],
         )
+
+    def predict_batch(self, sentences, allow_overlapping=False):
+        # Tokenization, i.e. computing spans, adding span markers to position_ids
+        tokenized = self.tokenizer(sentences, return_num_words=True,
+        return_batch_encoding=True,
+        return_group_lengths=True)
+        num_words = tokenized.pop("num_words")
+        group_lengths = tokenized.pop("group_lengths")
+        batch_encoding = tokenized.pop("batch_encoding")
+        # print(batch_encoding["input_ids"].shape)
+        # print(num_words)
+        # print(group_lengths)
+        # Converting into a common batch format like the data collator wants
+        tokenized = [
+            {key: value[idx] for key, value in tokenized.items()} for idx in range(len(tokenized["input_ids"]))
+        ]
+        # print(tokenized)
+        # Expanding the small tokenized output into full-scale input_ids, position_ids and attention_mask matrices.
+        collated = self.data_collator(tokenized)
+        # print(collated)
+        # Moving the inputs to the right device
+        inputs = {key: value.to(self.device) for key, value in collated.items()}
+        # print(inputs["input_ids"].shape)
+        logits = self(**inputs)
+        # print(logits.shape)
+        # Computing probabilities based on the logits
+        probs = logits.softmax(-1)
+        # print(probs.shape)
+        # Get the labels and the correponding probability scores
+        scores_batch, labels_batch = probs.max(-1)
+        # print(scores_batch.shape)
+        # print(labels_batch.shape)
+        batch_size=batch_encoding["input_ids"].shape[0]
+        for idx in range(batch_size):
+            # Reduce the dimensionality and convert to normal Python lists
+            scores = scores_batch[group_lengths[idx]:group_lengths[idx+1]].view(-1).tolist()
+            labels = labels_batch[group_lengths[idx]:group_lengths[idx+1]].view(-1).tolist()
+            # scores = scores_batch[idx].view(-1).tolist()
+            # labels = labels_batch[idx].view(-1).tolist()
+
+            # Get all of the valid spans to match with the score and labels
+            spans = list(self.tokenizer.get_all_valid_spans(num_words[idx], self.config.entity_max_length))
+
+            output = []
+            id2label = self.config.id2label
+            # If we don't allow overlapping, then we keep track of a boolean for each word, indicating if it has been
+            # selected already by a previous, higher score entity span
+            if not allow_overlapping:
+                word_selected = [False] * num_words[idx]
+            for (word_start_index, word_end_index), score, label_id in sorted(
+                zip(spans, scores, labels), key=lambda tup: tup[1], reverse=True
+            ):
+                if label_id != self.config.outside_id and (
+                    allow_overlapping or not any(word_selected[word_start_index:word_end_index])
+                ):
+                    char_start_index = batch_encoding.word_to_chars(idx, word_start_index).start
+                    char_end_index = batch_encoding.word_to_chars(idx, word_end_index - 1).end
+                    output.append(
+                        {
+                            "word": sentences[char_start_index:char_end_index]
+                            if isinstance(sentences, str)
+                            else sentences[idx][word_start_index:word_end_index],
+                            "label": id2label[label_id],
+                            "score": score,
+                        }
+                    )
+                    if isinstance(sentences, str):
+                        output[-1]["start"] = char_start_index
+                        output[-1]["end"] = char_end_index
+                    else:
+                        output[-1]["word_start_index"] = word_start_index
+                        output[-1]["word_end_index"] = word_end_index
+
+                    if not allow_overlapping:
+                        word_selected[word_start_index:word_end_index] = [True] * (word_end_index - word_start_index)
+            yield sorted(
+                output,
+                key=lambda entity: entity["start"] if isinstance(sentences, str) else entity["word_start_index"],
+            )
 
     def save_pretrained(
         self,
